@@ -1,32 +1,35 @@
 // Aufbau der Cytoscape-Instanz: Elemente, Spalten-Koordinaten und Stylesheet.
-// Positionen kommen ausschließlich aus graph.json (preset-Layout) – hier wird nichts gelayoutet.
+// Spalten (x) folgen dem `level` aus graph.json, die y-Positionen und Kantenspuren
+// berechnet layout.js. Cytoscape bekommt sie als preset-Layout – kein Force-/dagre-Layout.
 
 import { shortLabel, TEAM_ORDER } from './labels.js';
+import { computeLayout } from './layout.js';
 
 const FONT_STACK = 'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 const DEFAULT_NODE_WIDTH = 240;
 const DEFAULT_NODE_HEIGHT = 52;
 const DEFAULT_COLUMN_SPACING = 340;
+const DEFAULT_ROW_SPACING = 78;
 const DAG_PADDING = 30;
 
 /**
  * Ermittelt die Spalten aus meta.layout.levels.
  * Fehlt eine Ebene komplett (z. B. keine Dummy-Jobs → keine Ebene 0), werden die Spalten
- * lückenlos nebeneinandergesetzt. Das ist eine reine Verschiebung ganzer Spalten;
- * Reihenfolge und vertikale Positionen bleiben exakt wie berechnet.
+ * lückenlos nebeneinandergesetzt (reine Verschiebung ganzer Spalten).
  */
 export function computeColumns(index) {
   const layout = index.meta.layout || {};
   const spacing = layout.column_spacing || DEFAULT_COLUMN_SPACING;
-  let levels = Array.isArray(layout.levels) && layout.levels.length
-    ? layout.levels.map((level) => ({ ...level }))
-    : deriveLevels(index.jobNodes);
-  levels = levels.sort((a, b) => a.level - b.level);
+  const levels = Array.isArray(layout.levels) ? layout.levels.map((level) => ({ ...level })) : [];
+  // Ebenen, die Jobs haben, aber in meta.layout.levels fehlen, trotzdem als Spalte führen.
+  const known = new Set(levels.map((level) => level.level));
+  for (const derived of deriveLevels(index.jobNodes)) if (!known.has(derived.level)) levels.push(derived);
+  levels.sort((a, b) => a.level - b.level);
 
   const firstX = levels.length ? levels[0].x : 0;
   return levels.map((level, position) => {
     const displayX = firstX + position * spacing;
-    return { ...level, displayX, shift: displayX - level.x, width: spacing };
+    return { ...level, displayX, width: spacing };
   });
 }
 
@@ -42,13 +45,25 @@ function deriveLevels(jobNodes) {
   return [...byLevel.values()];
 }
 
+/** Maße des Rasters aus meta.layout (mit Standardwerten). */
+export function layoutDimensions(meta) {
+  const layout = meta.layout || {};
+  return {
+    nodeWidth: layout.node_width || DEFAULT_NODE_WIDTH,
+    nodeHeight: layout.node_height || DEFAULT_NODE_HEIGHT,
+    rowSpacing: layout.row_spacing || DEFAULT_ROW_SPACING,
+    columnSpacing: layout.column_spacing || DEFAULT_COLUMN_SPACING,
+    framePadding: DAG_PADDING,
+  };
+}
+
 /** Erzeugt die Cytoscape-Instanz mit festen, nicht verschiebbaren Positionen. */
 export function createGraph(container, index, columns, palette) {
-  const shiftByLevel = new Map(columns.map((column) => [column.level, column.shift]));
+  const { positions, edgeTurns } = computeLayout(index, columns, layoutDimensions(index.meta));
   const elements = [
     ...index.dagNodes.map(toDagElement),
-    ...index.jobNodes.map((job) => toJobElement(job, shiftByLevel.get(job.level) || 0)),
-    ...index.edges.map(toEdgeElement),
+    ...index.jobNodes.map((job) => toJobElement(job, positions.get(job.id))),
+    ...index.edges.map((edge) => toEdgeElement(edge, edgeTurns.get(edge.id))),
   ];
 
   return window.cytoscape({
@@ -75,7 +90,7 @@ function toDagElement(dag) {
   };
 }
 
-function toJobElement(job, shift) {
+function toJobElement(job, position) {
   return {
     group: 'nodes',
     data: {
@@ -85,15 +100,16 @@ function toJobElement(job, shift) {
       kind: job.kind,
       team: job.team,
     },
-    position: { x: job.x + shift, y: job.y },
+    position: { x: position.x, y: position.y },
     classes: [`kind-${job.kind}`, `team-${job.team}`, job.is_orphan ? 'orphan' : ''].join(' ').trim(),
   };
 }
 
-function toEdgeElement(edge) {
+function toEdgeElement(edge, turn) {
   return {
     group: 'edges',
-    data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind },
+    // turn: Knickpunkt in px hinter der Quelle (Spur in der Lücke zwischen den Spalten)
+    data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, turn },
     classes: `edge-${edge.kind}`,
   };
 }
@@ -214,11 +230,13 @@ function edgeStyles(palette) {
         'curve-style': 'taxi',
         'taxi-direction': 'rightward',
         'taxi-turn': '50%',
-        'taxi-radius': 10,
+        'taxi-turn-min-distance': 4,
+        'taxi-radius': 8,
         'transition-property': 'opacity, line-color, width',
         'transition-duration': 120,
       },
     },
+    { selector: 'edge[turn]', style: { 'taxi-turn': 'data(turn)' } },
     {
       selector: 'edge.edge-start',
       style: {
@@ -238,7 +256,10 @@ function edgeStyles(palette) {
         'target-arrow-color': palette.dataset,
         'target-arrow-shape': 'triangle',
         'arrow-scale': 1.3,
-        label: 'Dataset',
+        // Beschriftung direkt an der Quelle: Kanten derselben Quelle teilen sich eine Stelle.
+        'source-label': 'Dataset',
+        'source-text-offset': 34,
+        'source-text-margin-y': -9,
         'font-family': FONT_STACK,
         'font-size': 10,
         'font-weight': 700,
